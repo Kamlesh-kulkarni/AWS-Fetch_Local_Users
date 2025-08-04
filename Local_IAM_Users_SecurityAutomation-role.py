@@ -3,8 +3,9 @@ import csv
 import time
 import os
 from datetime import datetime, timezone
+from openpyxl import Workbook
 
-CSV_FILE = "IAM/credential_reports_merged.csv"
+CSV_FILE = "IAM/credential_reports_merged.xlsx"
 ACCOUNT_LIST_FILE = "account_list.csv"
 ROLE_NAME = "SecurityAutomation"
 CREDENTIALS_FILE = "aws_credentials.txt"  # credential file with access key and secret key
@@ -61,6 +62,16 @@ def parse_key_age(ts):
     except Exception:
         return ""
 
+def check_password_unused(ts):
+    if ts in ("N/A", "", None):
+        return ""
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - dt).days
+        return ">90 days" if days > 90 else ""
+    except Exception:
+        return ""
+
 def get_access_key_ids(iam, username):
     try:
         keys = iam.list_access_keys(UserName=username)["AccessKeyMetadata"]
@@ -70,7 +81,10 @@ def get_access_key_ids(iam, username):
 
 def main():
     accounts = get_account_list(ACCOUNT_LIST_FILE)
-    merged_rows = []
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "IAM Credential Report"
+
     header_written = False
 
     for account_id in accounts:
@@ -89,13 +103,22 @@ def main():
         lines = report_csv.strip().split("\n")
         header, *data_lines = lines
         header_fields = header.split(",")
-        header_extended = header_fields + [
-            "access_key_1_id", "access_key_2_id",
-            "access_key_1_age", "access_key_2_age", "account_id"
-        ]
 
+        # Fields to exclude (certs)
+        exclude_fields = [
+            "cert_1_active", "cert_1_last_rotated", "cert_2_active", "cert_2_last_rotated",
+            "password_last_used", "password_last_changed", "password_next_rotation"
+        ]
+        included_fields = [f for f in header_fields if f not in exclude_fields]
+
+        # Modified header with account_id inserted as 3rd col, and new column for password_unused_status
         if not header_written:
-            merged_rows.append(",".join(header_extended))
+            final_header = included_fields[:2] + ["account_id"] + included_fields[2:] + [
+                "access_key_1_id", "access_key_2_id",
+                "access_key_1_age", "access_key_2_age",
+                "password_unused_status"
+            ]
+            ws.append(final_header)
             header_written = True
 
         for line in data_lines:
@@ -104,8 +127,9 @@ def main():
             username = row_dict["user"]
 
             if username.startswith("<root_account>"):
-                extended_row = row_values + ["", "", "", "", account_id]
-                merged_rows.append(",".join(extended_row))
+                filtered_values = [row_dict[f] for f in included_fields]
+                final_row = filtered_values[:2] + [account_id] + filtered_values[2:] + ["", "", "", "", ""]
+                ws.append(final_row)
                 continue
 
             key_ids = get_access_key_ids(iam, username)
@@ -116,18 +140,17 @@ def main():
             key1_id = key_ids.get(k1_rot, "")
             key2_id = key_ids.get(k2_rot, "")
 
-            extended_row = row_values + [key1_id, key2_id, key1_age, key2_age, account_id]
-            merged_rows.append(",".join(extended_row))
+            password_unused = check_password_unused(row_dict["password_last_used"])
 
-    if merged_rows:
-        os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
-        with open(CSV_FILE, "w", newline="") as f:
-            for row in merged_rows:
-                f.write(row + "\n")
+            filtered_values = [row_dict[f] for f in included_fields]
+            final_row = filtered_values[:2] + [account_id] + filtered_values[2:] + [
+                key1_id, key2_id, key1_age, key2_age, password_unused
+            ]
+            ws.append(final_row)
 
-        print(f"[SUCCESS] Report saved to: {CSV_FILE}")
-    else:
-        print("[INFO] No data to write.")
+    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+    wb.save(CSV_FILE)
+    print(f"[SUCCESS] Excel report saved to: {CSV_FILE}")
 
 if __name__ == "__main__":
     main()
